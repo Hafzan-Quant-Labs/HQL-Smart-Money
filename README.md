@@ -1,5 +1,5 @@
 # HQL Smart Money Structure
-### by [Hafzan Quant Labs](https://github.com/HafzanQuantLabs)
+### by [Hafzan Quant Labs](https://github.com/Hafzan-Quant-Labs?view_as=public)
 
 ![Pine Script](https://img.shields.io/badge/Pine%20Script-v5-1E88E5?style=for-the-badge&logo=tradingview&logoColor=white)
 ![Platform](https://img.shields.io/badge/Platform-TradingView-131722?style=for-the-badge&logo=tradingview&logoColor=white)
@@ -186,6 +186,6 @@ Unauthorized copying, modification, distribution, or commercial use is strictly 
 
 <div align="center">
 
-**[Hafzan Quant Labs](https://github.com/HafzanQuantLabs)** — Quantitative tools for serious traders.
+**[Hafzan Quant Labs](https://github.com/Hafzan-Quant-Labs?view_as=public)** — Quantitative tools for serious traders.
 
 </div>
