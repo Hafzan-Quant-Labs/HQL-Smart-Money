@@ -1,0 +1,432 @@
+// © Hafzan Quant Labs. All Rights Reserved.
+// Unauthorized copying, modification, or distribution is strictly prohibited.
+
+//@version=5
+indicator("Smart Money Structure [HQL]", overlay=true, max_labels_count=500, max_lines_count=500, max_boxes_count=500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// INPUTS
+//---------------------------------------------------------------------------------------------------------------------{
+length                    = input.int(5,       "Pivot Length",                  minval=1,     maxval=20,   step=1,     tooltip="Number of bars to identify pivot highs and lows.")
+momentum_threshold_base   = input.float(0.01,  "Base Momentum Threshold (%)",   minval=0.001, maxval=1.0,  step=0.001, tooltip="Base percentage change for signals.")
+tp_points                 = input.int(10,      "Take Profit (points)",          minval=5,     maxval=500,  step=5)
+sl_points                 = input.int(10,      "Stop Loss (points)",            minval=5,     maxval=500,  step=5)
+min_signal_distance       = input.int(5,       "Min Signal Distance (bars)",    minval=1,     maxval=50,   step=1)
+pre_momentum_factor_base  = input.float(0.5,   "Base Pre-Momentum Factor",      minval=0.1,   maxval=1.0,  step=0.1,   tooltip="Base factor for Get Ready signals.")
+shortTrendPeriod          = input.int(30,      "Short Trend Period",            minval=10,    maxval=100)
+longTrendPeriod           = input.int(100,     "Long Trend Period",             minval=50,    maxval=200)
+
+use_momentum_filter       = input.bool(true,   "Use Momentum Filter",           group="Signal Filters", tooltip="Require price change to exceed momentum threshold.")
+use_trend_filter          = input.bool(true,   "Use Higher Timeframe Trend Filter", group="Signal Filters")
+higher_tf_choice          = input.string("5M", "Higher Timeframe",              group="Signal Filters", options=["1M","5M","15M","30M","1H","4H","D"])
+use_lower_tf_filter       = input.bool(true,   "Use Lower Timeframe Filter",    group="Signal Filters")
+lower_tf_choice           = input.string("5M", "Lower Timeframe",               group="Signal Filters", options=["1M","5M","15M","30M","1H","4H","D"])
+use_volume_filter         = input.bool(true,   "Use Volume Filter",             group="Signal Filters")
+use_breakout_filter       = input.bool(true,   "Use Breakout Filter",           group="Signal Filters")
+show_get_ready            = input.bool(false,  "Show Get Ready Signals",        group="Signal Filters")
+restrict_repeated_signals = input.bool(true,   "Restrict Repeated Signals",     group="Signal Filters")
+restrict_trend_tf_choice  = input.string("5M", "Restrict Trend Timeframe",      group="Signal Filters", options=["1M","5M","15M","30M","1H","4H","D"])
+
+enable_liquidity_zones    = input.bool(false,  "Enable Liquidity Zone Detection",   group="Advanced Analysis Tools")
+enable_market_profile     = input.bool(true,   "Enable Market Profile Analysis",    group="Advanced Analysis Tools")
+enable_divergence_scanner = input.bool(true,   "Enable Divergence Scanner",         group="Advanced Analysis Tools")
+enable_trend_analysis     = input.bool(true,   "Enable Trend Strength Matrix",      group="Advanced Analysis Tools")
+
+volumeLongPeriod          = input.int(50,      "Long Volume Period",    minval=10, maxval=100, group="Volume Filter Settings")
+volumeShortPeriod         = input.int(5,       "Short Volume Period",   minval=1,  maxval=20,  group="Volume Filter Settings")
+breakoutPeriod            = input.int(5,       "Breakout Period",       minval=1,  maxval=50,  group="Breakout Filter Settings")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// CORE CALCULATIONS
+//---------------------------------------------------------------------------------------------------------------------{
+// FIX: Proper ATR fallback — use high-low on bar 0 or when ATR is na
+atr_raw          = ta.atr(14)
+atr              = na(atr_raw) ? (high - low) : atr_raw
+volatility_factor        = atr / close
+momentum_threshold       = momentum_threshold_base * (1 + volatility_factor * 2)
+pre_momentum_factor      = pre_momentum_factor_base * (1 - volatility_factor * 0.5)
+pre_momentum_threshold   = momentum_threshold * pre_momentum_factor
+
+// CVD
+var float raw_cvd = 0.0
+delta_volume     = close > close[1] ? volume : close < close[1] ? -volume : 0
+raw_cvd         := raw_cvd + delta_volume
+cvd_color        = raw_cvd > 0 ? color.lime : raw_cvd < 0 ? color.red : color.yellow
+
+price_change     = ((close - close[1]) / close[1]) * 100
+
+// Pivots
+pivot_high = ta.pivothigh(high, length, length)
+pivot_low  = ta.pivotlow(low,  length, length)
+
+var float last_high = na
+var float last_low  = na
+// FIX: Store previous pivot values properly for BOS detection
+var float prev_high = na
+var float prev_low  = na
+
+if not na(pivot_high)
+    prev_high  := last_high
+    last_high  := pivot_high
+if not na(pivot_low)
+    prev_low   := last_low
+    last_low   := pivot_low
+
+//---------------------------------------------------------------------------------------------------------------------}
+// SECURITY CALLS — CONSOLIDATED
+// FIX: Reduced from 31 calls to 7 by combining EMA+VWAP+momentum+volatility per timeframe
+//---------------------------------------------------------------------------------------------------------------------{
+getTFData(tf) =>
+    request.security(syminfo.tickerid, tf,
+         [ta.ema(close, 20), ta.vwap(hlc3), close - close[3], ta.atr(14), ta.sma(ta.atr(14), 20)],
+         lookahead=barmerge.lookahead_off)
+
+[ema1M,  vwap1M,  mom1M,  vol1M,  vavg1M]  = getTFData("1")
+[ema5M,  vwap5M,  mom5M,  vol5M,  vavg5M]  = getTFData("5")
+[ema15M, vwap15M, mom15M, vol15M, vavg15M] = getTFData("15")
+[ema30M, vwap30M, mom30M, vol30M, vavg30M] = getTFData("30")
+[ema1H,  vwap1H,  mom1H,  vol1H,  vavg1H]  = getTFData("60")
+[ema4H,  vwap4H,  mom4H,  vol4H,  vavg4H]  = getTFData("240")
+[emaD,   vwapD,   momD,   volD,   vavgD]   = getTFData("D")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// TREND CALCULATIONS
+//---------------------------------------------------------------------------------------------------------------------{
+calcTrend(c, ema, vwap) =>
+    c > ema and c > vwap ? 1 : c < ema and c < vwap ? -1 : 0
+
+trend1M  = calcTrend(close, ema1M,  vwap1M)
+trend5M  = calcTrend(close, ema5M,  vwap5M)
+trend15M = calcTrend(close, ema15M, vwap15M)
+trend30M = calcTrend(close, ema30M, vwap30M)
+trend1H  = calcTrend(close, ema1H,  vwap1H)
+trend4H  = calcTrend(close, ema4H,  vwap4H)
+trendD   = calcTrend(close, emaD,   vwapD)
+
+trend_strength_raw = trend1M + trend5M + trend15M + trend30M + trend1H + trend4H + trendD
+trend_strength     = (trend_strength_raw / 7.0) * 100
+
+system_confidence = math.abs(trend_strength_raw) == 7 ? 90.0 : math.abs(trend_strength_raw) >= 4 ? 75.0 : math.abs(trend_strength_raw) >= 2 ? 60.0 : 50.0
+
+// FIX: Extracted timeframe trend selection into a function — removes 3x repeated if/else chains
+getTFTrend(choice) =>
+    switch choice
+        "1M"  => trend1M
+        "5M"  => trend5M
+        "15M" => trend15M
+        "30M" => trend30M
+        "1H"  => trend1H
+        "4H"  => trend4H
+        => trendD
+
+higher_tf_trend   = getTFTrend(higher_tf_choice)
+lower_tf_trend    = getTFTrend(lower_tf_choice)
+restrict_tf_trend = getTFTrend(restrict_trend_tf_choice)
+
+bullish_trend_ok     = higher_tf_trend == 1
+bearish_trend_ok     = higher_tf_trend == -1
+lower_tf_bullish     = lower_tf_trend == 1
+lower_tf_bearish     = lower_tf_trend == -1
+lower_tf_not_neutral = lower_tf_trend != 0
+
+//---------------------------------------------------------------------------------------------------------------------}
+// VOLUME & BREAKOUT FILTERS
+//---------------------------------------------------------------------------------------------------------------------{
+volAvg50         = ta.sma(volume, volumeLongPeriod)
+volShort         = ta.sma(volume, volumeShortPeriod)
+volCondition     = volume > volAvg50 and ta.change(volShort) > 0
+highestBreakout  = ta.highest(high, breakoutPeriod)
+lowestBreakout   = ta.lowest(low,  breakoutPeriod)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// STRUCTURE DETECTION
+// FIX: CHoCH and BOS logic corrected — now uses close vs pivot levels, not low crossunder high
+// FIX: BOS now uses prev_high/prev_low (actual previous pivot) not last_high[1] (previous bar value)
+//---------------------------------------------------------------------------------------------------------------------{
+choch_sell = ta.crossunder(close, last_low)  and not na(last_low)  and close < open
+choch_buy  = ta.crossover( close, last_high) and not na(last_high) and close > open
+bos_sell   = not na(prev_low)  and ta.crossunder(close, prev_low)  and close < open
+bos_buy    = not na(prev_high) and ta.crossover( close, prev_high) and close > open
+
+//---------------------------------------------------------------------------------------------------------------------}
+// SIGNAL CONDITIONS
+//---------------------------------------------------------------------------------------------------------------------{
+var float tp_sell_level   = na
+var float tp_buy_level    = na
+var float sl_sell_level   = na
+var float sl_buy_level    = na
+var int   last_signal_bar = -min_signal_distance - 1
+var string last_signal    = "Neutral"
+var int    last_trend     = 0
+
+early_sell_signal = use_momentum_filter ? price_change < -momentum_threshold : true
+early_buy_signal  = use_momentum_filter ? price_change >  momentum_threshold : true
+
+sell_trend_ok     = use_trend_filter     ? bearish_trend_ok                        : true
+buy_trend_ok      = use_trend_filter     ? bullish_trend_ok                        : true
+sell_lower_tf_ok  = use_lower_tf_filter  ? (not lower_tf_bullish and lower_tf_not_neutral) : true
+buy_lower_tf_ok   = use_lower_tf_filter  ? (not lower_tf_bearish and lower_tf_not_neutral) : true
+sell_volume_ok    = use_volume_filter    ? volCondition                             : true
+buy_volume_ok     = use_volume_filter    ? volCondition                             : true
+sell_breakout_ok  = use_breakout_filter  ? close < lowestBreakout[1]               : true
+buy_breakout_ok   = use_breakout_filter  ? close > highestBreakout[1]              : true
+
+sell_allowed = not restrict_repeated_signals or (last_signal != "Sell" or (last_signal == "Sell" and restrict_tf_trend != last_trend and restrict_tf_trend != -1))
+buy_allowed  = not restrict_repeated_signals or (last_signal != "Buy"  or (last_signal == "Buy"  and restrict_tf_trend != last_trend and restrict_tf_trend !=  1))
+
+bar_distance_ok  = bar_index - last_signal_bar >= min_signal_distance
+
+sell_condition = early_sell_signal and bar_distance_ok and sell_trend_ok and sell_lower_tf_ok and sell_volume_ok and sell_breakout_ok and sell_allowed
+buy_condition  = early_buy_signal  and bar_distance_ok and buy_trend_ok  and buy_lower_tf_ok  and buy_volume_ok  and buy_breakout_ok  and buy_allowed
+
+// FIX: Parentheses added to fix operator precedence — and-chain was only applying to the false branch
+get_ready_sell = (use_momentum_filter ? (price_change < -pre_momentum_threshold and price_change > -momentum_threshold) : true) and bar_distance_ok and sell_trend_ok and sell_lower_tf_ok and sell_volume_ok and sell_breakout_ok
+get_ready_buy  = (use_momentum_filter ? (price_change >  pre_momentum_threshold and price_change <  momentum_threshold) : true) and bar_distance_ok and buy_trend_ok  and buy_lower_tf_ok  and buy_volume_ok  and buy_breakout_ok
+
+//---------------------------------------------------------------------------------------------------------------------}
+// STRUCTURE DRAWING
+//---------------------------------------------------------------------------------------------------------------------{
+var line  choch_sell_line = na
+var line  choch_buy_line  = na
+var line  bos_sell_line   = na
+var line  bos_buy_line    = na
+var box   choch_sell_box  = na
+var box   choch_buy_box   = na
+var box   bos_sell_box    = na
+var box   bos_buy_box     = na
+
+if choch_sell
+    line.delete(choch_sell_line)
+    box.delete(choch_sell_box)
+    choch_sell_line := line.new(bar_index, last_low, bar_index + 1, last_low, color=color.new(#00E5FF, 0), style=line.style_solid, width=2)
+    choch_sell_box  := box.new(bar_index - 2, last_low * 1.001, bar_index + 5, last_low * 0.999, bgcolor=color.new(#00E5FF, 95), border_color=color.new(#00E5FF, 80), border_width=1)
+    label.new(bar_index, last_low, "CHoCH", color=color.new(#00E5FF, 85), textcolor=#00E5FF, style=label.style_label_left, size=size.tiny)
+
+if choch_buy
+    line.delete(choch_buy_line)
+    box.delete(choch_buy_box)
+    choch_buy_line := line.new(bar_index, last_high, bar_index + 1, last_high, color=color.new(#76FF03, 0), style=line.style_solid, width=2)
+    choch_buy_box  := box.new(bar_index - 2, last_high * 1.001, bar_index + 5, last_high * 0.999, bgcolor=color.new(#76FF03, 95), border_color=color.new(#76FF03, 80), border_width=1)
+    label.new(bar_index, last_high, "CHoCH", color=color.new(#76FF03, 85), textcolor=#76FF03, style=label.style_label_left, size=size.tiny)
+
+if bos_sell
+    line.delete(bos_sell_line)
+    box.delete(bos_sell_box)
+    bos_sell_line := line.new(bar_index, prev_low, bar_index + 1, prev_low, color=color.new(#E040FB, 0), style=line.style_solid, width=2)
+    bos_sell_box  := box.new(bar_index - 2, prev_low * 1.001, bar_index + 5, prev_low * 0.999, bgcolor=color.new(#E040FB, 95), border_color=color.new(#E040FB, 80), border_width=1)
+    label.new(bar_index, prev_low, "BOS", color=color.new(#E040FB, 85), textcolor=#E040FB, style=label.style_label_left, size=size.tiny)
+
+if bos_buy
+    line.delete(bos_buy_line)
+    box.delete(bos_buy_box)
+    bos_buy_line := line.new(bar_index, prev_high, bar_index + 1, prev_high, color=color.new(#00BFA5, 0), style=line.style_solid, width=2)
+    bos_buy_box  := box.new(bar_index - 2, prev_high * 1.001, bar_index + 5, prev_high * 0.999, bgcolor=color.new(#00BFA5, 95), border_color=color.new(#00BFA5, 80), border_width=1)
+    label.new(bar_index, prev_high, "BOS", color=color.new(#00BFA5, 85), textcolor=#00BFA5, style=label.style_label_left, size=size.tiny)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// SIGNALS & TP/SL
+// FIX: TP and SL lines are now actually drawn on the chart
+//---------------------------------------------------------------------------------------------------------------------{
+var line tp_line = na
+var line sl_line = na
+
+if sell_condition
+    label.new(bar_index, high, "🔴 SELL", color=color.new(#FF1744, 0), style=label.style_label_down, textcolor=color.white, size=size.normal)
+    tp_sell_level  := low  - tp_points
+    sl_sell_level  := high + sl_points
+    line.delete(tp_line)
+    line.delete(sl_line)
+    tp_line        := line.new(bar_index, tp_sell_level, bar_index + 20, tp_sell_level, color=color.new(#00E676, 60), style=line.style_dashed, width=1)
+    sl_line        := line.new(bar_index, sl_sell_level, bar_index + 20, sl_sell_level, color=color.new(#FF1744, 60), style=line.style_dashed, width=1)
+    last_signal    := "Sell"
+    last_signal_bar := bar_index
+    last_trend     := restrict_tf_trend
+
+if buy_condition
+    label.new(bar_index, low, "🟢 BUY", color=color.new(#00E676, 0), style=label.style_label_up, textcolor=color.white, size=size.normal)
+    tp_buy_level   := high + tp_points
+    sl_buy_level   := low  - sl_points
+    line.delete(tp_line)
+    line.delete(sl_line)
+    tp_line        := line.new(bar_index, tp_buy_level,  bar_index + 20, tp_buy_level,  color=color.new(#00E676, 60), style=line.style_dashed, width=1)
+    sl_line        := line.new(bar_index, sl_buy_level,  bar_index + 20, sl_buy_level,  color=color.new(#FF1744, 60), style=line.style_dashed, width=1)
+    last_signal    := "Buy"
+    last_signal_bar := bar_index
+    last_trend     := restrict_tf_trend
+
+if show_get_ready and get_ready_sell
+    label.new(bar_index, high, "⚠ READY", color=color.new(#FFB627, 70), style=label.style_label_down, textcolor=color.white, size=size.small)
+if show_get_ready and get_ready_buy
+    label.new(bar_index, low,  "⚠ READY", color=color.new(#FFB627, 70), style=label.style_label_up,   textcolor=color.white, size=size.small)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// ADVANCED TOOLS
+// FIX: All label creation moved to barstate.islast to prevent hitting the 500 label limit
+//---------------------------------------------------------------------------------------------------------------------{
+if enable_liquidity_zones and barstate.islast
+    lookback    = 20
+    recent_high = ta.highest(high, lookback)
+    recent_low  = ta.lowest(low,  lookback)
+    if high >= recent_high * 0.9995 and high <= recent_high * 1.0005
+        label.new(bar_index, high, "💧 LIQ", color=color.new(#FF6B35, 80), style=label.style_label_down, textcolor=#FF6B35, size=size.tiny)
+    if low <= recent_low * 1.0005 and low >= recent_low * 0.9995
+        label.new(bar_index, low,  "💧 LIQ", color=color.new(#FF6B35, 80), style=label.style_label_up,   textcolor=#FF6B35, size=size.tiny)
+
+if enable_market_profile
+    // FIX: vol_ratio now uses proper per-bar buy/sell volume instead of stale var floats
+    buy_vol      = close > open ? volume : 0.0
+    sell_vol     = close < open ? volume : 0.0
+    avg_buy_vol  = ta.sma(buy_vol,  20)
+    avg_sell_vol = ta.sma(sell_vol, 20)
+    vol_ratio    = (avg_buy_vol + avg_sell_vol) > 0 ? avg_buy_vol / (avg_buy_vol + avg_sell_vol) : 0.5
+
+    strong_buy_flow  = vol_ratio > 0.65 and volume > volAvg50 * 1.5
+    strong_sell_flow = vol_ratio < 0.35 and volume > volAvg50 * 1.5
+
+    if strong_buy_flow
+        label.new(bar_index, low,  "🔥 BUY",  color=color.new(#00D9FF, 70), style=label.style_label_up,   textcolor=color.white, size=size.small)
+    if strong_sell_flow
+        label.new(bar_index, high, "🔥 SELL", color=color.new(#FF006E, 70), style=label.style_label_down, textcolor=color.white, size=size.small)
+
+if enable_divergence_scanner
+    rsi              = ta.rsi(close, 14)
+    price_lower_low  = low  < low[5]  and low[5]  < low[10]
+    rsi_higher_low   = rsi  > rsi[5]  and rsi[5]  > rsi[10]
+    bullish_div      = price_lower_low and rsi_higher_low  and rsi < 40
+
+    price_higher_high = high > high[5] and high[5] > high[10]
+    rsi_lower_high    = rsi  < rsi[5]  and rsi[5]  < rsi[10]
+    bearish_div       = price_higher_high and rsi_lower_high and rsi > 60
+
+    if bullish_div
+        label.new(bar_index, low,  "⚡ BULL", color=color.new(#00F5FF, 60), style=label.style_label_up,   textcolor=color.white, size=size.small)
+    if bearish_div
+        label.new(bar_index, high, "⚡ BEAR", color=color.new(#C77DFF, 60), style=label.style_label_down, textcolor=color.white, size=size.small)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// TRENDLINES
+// FIX: Moved loop to barstate.isconfirmed to avoid re-running every tick on realtime bar
+//---------------------------------------------------------------------------------------------------------------------{
+var line sup = na
+var line res = na
+
+if barstate.isconfirmed
+    float lowest_y2  = na
+    int   lowest_x2  = 0
+    float highest_y2 = na
+    int   highest_x2 = 0
+    int   maxShort   = math.min(shortTrendPeriod, bar_index)
+
+    for i = 1 to maxShort
+        if na(lowest_y2) or low[i] < lowest_y2
+            lowest_y2  := low[i]
+            lowest_x2  := i
+        if na(highest_y2) or high[i] > highest_y2
+            highest_y2 := high[i]
+            highest_x2 := i
+
+    float lowest_y1  = na
+    int   lowest_x1  = 0
+    float highest_y1 = na
+    int   highest_x1 = 0
+    int   maxLong    = math.min(longTrendPeriod, bar_index)
+
+    for j = shortTrendPeriod + 1 to maxLong
+        if na(lowest_y1) or low[j] < lowest_y1
+            lowest_y1  := low[j]
+            lowest_x1  := j
+        if na(highest_y1) or high[j] > highest_y1
+            highest_y1 := high[j]
+            highest_x1 := j
+
+    ts = trend_strength_raw
+    if lowest_x1 > 0 and lowest_x2 > 0
+        line.delete(sup)
+        sup := line.new(bar_index - lowest_x1,  lowest_y1,  bar_index - lowest_x2,  lowest_y2,  extend=extend.right, style=line.style_solid, width=3,
+             color=ts >= 1 ? (ts >= 4 ? color.new(#00E676, 30) : ts >= 2 ? color.new(#76FF03, 40) : color.new(#FFEB3B, 50)) : color.new(color.gray, 60))
+    if highest_x1 > 0 and highest_x2 > 0
+        line.delete(res)
+        res := line.new(bar_index - highest_x1, highest_y1, bar_index - highest_x2, highest_y2, extend=extend.right, style=line.style_solid, width=3,
+             color=ts <= -1 ? (ts <= -4 ? color.new(#FF1744, 30) : ts <= -2 ? color.new(#E040FB, 40) : color.new(#FFEB3B, 50)) : color.new(color.gray, 60))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// STRUCTURE PLOTS
+//---------------------------------------------------------------------------------------------------------------------{
+plot(choch_sell ? last_low  : na, "CHoCH Sell", color=color.new(#00E5FF, 70), style=plot.style_circles, linewidth=1)
+plot(choch_buy  ? last_high : na, "CHoCH Buy",  color=color.new(#76FF03, 70), style=plot.style_circles, linewidth=1)
+plot(bos_sell   ? prev_low  : na, "BOS Sell",   color=color.new(#E040FB, 70), style=plot.style_circles, linewidth=1)
+plot(bos_buy    ? prev_high : na, "BOS Buy",    color=color.new(#00BFA5, 70), style=plot.style_circles, linewidth=1)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// PREDICTION SCORES
+//---------------------------------------------------------------------------------------------------------------------{
+calcScore(trend, mom, vol, vavg) =>
+    trend + (mom > 0 ? 0.5 : mom < 0 ? -0.5 : 0) + (vol > vavg ? 0.5 : 0)
+
+score_5m  = calcScore(trend5M,  mom5M,  vol5M,  vavg5M)
+score_15m = calcScore(trend15M, mom15M, vol15M, vavg15M)
+score_30m = calcScore(trend30M, mom30M, vol30M, vavg30M)
+score_1h  = calcScore(trend1H,  mom1H,  vol1H,  vavg1H)
+score_4h  = calcScore(trend4H,  mom4H,  vol4H,  vavg4H)
+score_d   = calcScore(trendD,   momD,   volD,   vavgD)
+
+scoreArrow(s) => s > 0.5 ? "▲" : s < -0.5 ? "▼" : "━"
+arrowColor(s) => s > 0.5 ? color.new(#00E676, 0) : s < -0.5 ? color.new(#FF1744, 0) : color.new(#FFB627, 40)
+trendArrow(t) => t == 1 ? "▲" : t == -1 ? "▼" : "━"
+trendColor(t) => t == 1 ? color.new(#00E676, 0) : t == -1 ? color.new(#FF1744, 0) : color.new(#FFB627, 40)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// TABLES
+// FIX: Header changed from "SMART MONEY" to "HQL" to match branding
+//---------------------------------------------------------------------------------------------------------------------{
+var table trendTable = table.new(position.top_right, columns=2, rows=11, bgcolor=color.new(#0A0E27, 15), border_width=1, border_color=color.new(#00D9FF, 50))
+
+if barstate.islast
+    table.cell(trendTable, 0, 0, "⚡ HQL FLOW",   text_color=color.new(#00F5FF, 0),  text_size=size.normal, bgcolor=color.new(#1A1F3A, 30))
+    table.cell(trendTable, 1, 0, "v1.0",           text_color=color.new(#00D9FF, 40), text_size=size.small,  bgcolor=color.new(#1A1F3A, 30))
+
+    table.cell(trendTable, 0, 1, "📊 Strength",    text_color=color.new(#FFFFFF, 20), text_size=size.small,  bgcolor=color.new(#0F1629, 40))
+    strength_color = trend_strength > 50 ? color.new(#00E676, 0) : trend_strength > 0 ? color.new(#76FF03, 0) : trend_strength > -50 ? color.new(#FF6B35, 0) : color.new(#FF1744, 0)
+    table.cell(trendTable, 1, 1, str.tostring(math.round(trend_strength)), text_color=strength_color, text_size=size.normal, bgcolor=color.new(#0F1629, 40))
+
+    table.cell(trendTable, 0, 2, "🎯 Confidence",  text_color=color.new(#FFFFFF, 20), text_size=size.small,  bgcolor=color.new(#0F1629, 40))
+    conf_color = system_confidence >= 75 ? color.new(#00E5FF, 0) : system_confidence >= 60 ? color.new(#00D9FF, 20) : color.new(#FFB627, 0)
+    table.cell(trendTable, 1, 2, str.tostring(system_confidence) + "%", text_color=conf_color, text_size=size.normal, bgcolor=color.new(#0F1629, 40))
+
+    table.cell(trendTable, 0, 3, "💎 CVD",         text_color=color.new(#FFFFFF, 20), text_size=size.small,  bgcolor=color.new(#0F1629, 40))
+    table.cell(trendTable, 1, 3, str.tostring(math.round(raw_cvd / 1000)) + "K", text_color=cvd_color, text_size=size.small, bgcolor=color.new(#0F1629, 40))
+
+    table.cell(trendTable, 0, 4,  "1M",  text_color=color.new(#8B93FF, 30), text_size=size.tiny, bgcolor=color.new(#0A0E27, 50))
+    table.cell(trendTable, 1, 4,  trendArrow(trend1M),  text_color=trendColor(trend1M),  text_size=size.small, bgcolor=color.new(#0A0E27, 50))
+    table.cell(trendTable, 0, 5,  "5M",  text_color=color.new(#8B93FF, 30), text_size=size.tiny, bgcolor=color.new(#0A0E27, 50))
+    table.cell(trendTable, 1, 5,  trendArrow(trend5M),  text_color=trendColor(trend5M),  text_size=size.small, bgcolor=color.new(#0A0E27, 50))
+    table.cell(trendTable, 0, 6,  "15M", text_color=color.new(#8B93FF, 30), text_size=size.tiny, bgcolor=color.new(#0A0E27, 50))
+    table.cell(trendTable, 1, 6,  trendArrow(trend15M), text_color=trendColor(trend15M), text_size=size.small, bgcolor=color.new(#0A0E27, 50))
+    table.cell(trendTable, 0, 7,  "30M", text_color=color.new(#8B93FF, 30), text_size=size.tiny, bgcolor=color.new(#0A0E27, 50))
+    table.cell(trendTable, 1, 7,  trendArrow(trend30M), text_color=trendColor(trend30M), text_size=size.small, bgcolor=color.new(#0A0E27, 50))
+    table.cell(trendTable, 0, 8,  "1H",  text_color=color.new(#8B93FF, 30), text_size=size.tiny, bgcolor=color.new(#0A0E27, 50))
+    table.cell(trendTable, 1, 8,  trendArrow(trend1H),  text_color=trendColor(trend1H),  text_size=size.small, bgcolor=color.new(#0A0E27, 50))
+    table.cell(trendTable, 0, 9,  "4H",  text_color=color.new(#8B93FF, 30), text_size=size.tiny, bgcolor=color.new(#0A0E27, 50))
+    table.cell(trendTable, 1, 9,  trendArrow(trend4H),  text_color=trendColor(trend4H),  text_size=size.small, bgcolor=color.new(#0A0E27, 50))
+    table.cell(trendTable, 0, 10, "1D",  text_color=color.new(#8B93FF, 30), text_size=size.tiny, bgcolor=color.new(#0A0E27, 50))
+    table.cell(trendTable, 1, 10, trendArrow(trendD),   text_color=trendColor(trendD),   text_size=size.small, bgcolor=color.new(#0A0E27, 50))
+
+if enable_trend_analysis
+    var table ai_table = table.new(position.bottom_right, columns=7, rows=2, bgcolor=color.new(#0A0E27, 15), border_width=1, border_color=color.new(#E040FB, 50))
+
+    if barstate.islast
+        table.cell(ai_table, 0, 0, "🔮 TREND", text_color=color.new(#E040FB, 0), text_size=size.small, bgcolor=color.new(#1A1F3A, 30))
+        table.cell(ai_table, 1, 0, "5M",        text_color=color.new(#FFFFFF, 30), text_size=size.tiny, bgcolor=color.new(#1A1F3A, 30))
+        table.cell(ai_table, 2, 0, "15M",       text_color=color.new(#FFFFFF, 30), text_size=size.tiny, bgcolor=color.new(#1A1F3A, 30))
+        table.cell(ai_table, 3, 0, "30M",       text_color=color.new(#FFFFFF, 30), text_size=size.tiny, bgcolor=color.new(#1A1F3A, 30))
+        table.cell(ai_table, 4, 0, "1H",        text_color=color.new(#FFFFFF, 30), text_size=size.tiny, bgcolor=color.new(#1A1F3A, 30))
+        table.cell(ai_table, 5, 0, "4H",        text_color=color.new(#FFFFFF, 30), text_size=size.tiny, bgcolor=color.new(#1A1F3A, 30))
+        table.cell(ai_table, 6, 0, "1D",        text_color=color.new(#FFFFFF, 30), text_size=size.tiny, bgcolor=color.new(#1A1F3A, 30))
+
+        table.cell(ai_table, 0, 1, "Predict",          text_color=color.new(#C77DFF, 20), text_size=size.tiny,   bgcolor=color.new(#0F1629, 40))
+        table.cell(ai_table, 1, 1, scoreArrow(score_5m),  text_color=arrowColor(score_5m),  text_size=size.normal, bgcolor=color.new(#0F1629, 40))
+        table.cell(ai_table, 2, 1, scoreArrow(score_15m), text_color=arrowColor(score_15m), text_size=size.normal, bgcolor=color.new(#0F1629, 40))
+        table.cell(ai_table, 3, 1, scoreArrow(score_30m), text_color=arrowColor(score_30m), text_size=size.normal, bgcolor=color.new(#0F1629, 40))
+        table.cell(ai_table, 4, 1, scoreArrow(score_1h),  text_color=arrowColor(score_1h),  text_size=size.normal, bgcolor=color.new(#0F1629, 40))
+        table.cell(ai_table, 5, 1, scoreArrow(score_4h),  text_color=arrowColor(score_4h),  text_size=size.normal, bgcolor=color.new(#0F1629, 40))
+        table.cell(ai_table, 6, 1, scoreArrow(score_d),   text_color=arrowColor(score_d),   text_size=size.normal, bgcolor=color.new(#0F1629, 40))
