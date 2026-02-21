@@ -11,9 +11,8 @@
 ---
 
 ## 📸 Preview
-
-> *Add a screenshot of the indicator on a chart here*
-
+<img width="1316" height="760" alt="Screenshot 2026-02-21 at 3 29 05 PM" src="https://github.com/user-attachments/assets/a4626d6b-c21f-4f4e-8dc3-93f1b0152d56" />
+ 
 ---
 
 ## ✨ Features
